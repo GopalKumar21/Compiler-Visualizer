@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, render_template
 import re
 import logging
+import uuid
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ class CCompiler:
             self.errors.append(f"Line {type_token[2]}: Expected identifier after 'int'")
             return i, None
         var_name = self.tokens[i][1]
+        line_num = self.tokens[i][2]
         i += 1
         if i < len(self.tokens) and self.tokens[i][1] == "(":
             i += 1
@@ -126,19 +128,18 @@ class CCompiler:
             i += 1
             if len(expr) == 1 and expr[0][0] in ["LITERAL", "IDENTIFIER"]:
                 value = expr[0][1]
+                return i, ("DECLARATION", "int", var_name, value, line_num)
+            elif len(expr) == 3 and expr[1][0] == "OPERATOR" and expr[1][1] in ["+", "-", "*", "/"]:
+                return i, ("DECLARATION", "int", var_name, (expr[1][1], expr[0][1], expr[2][1]), line_num)
             else:
-                value = " ".join(token[1] for token in expr)
-                for token in expr:
-                    if token[0] not in ["LITERAL", "IDENTIFIER", "OPERATOR"]:
-                        self.errors.append(f"Line {type_token[2]}: Invalid token '{token[1]}' in declaration expression")
-                        return i, None
-            return i, ("DECLARATION", "int", var_name, value)
+                self.errors.append(f"Line {type_token[2]}: Invalid expression in declaration")
+                return i, None
         else:
             if i >= len(self.tokens) or self.tokens[i][1] != ";":
                 self.errors.append(f"Line {type_token[2]}: Missing ';' after declaration")
                 return i, None
             i += 1
-            return i, ("DECLARATION", "int", var_name, None)
+            return i, ("DECLARATION", "int", var_name, None, line_num)
 
     def parse_assignment(self, i):
         var_name = self.tokens[i][1]
@@ -157,23 +158,20 @@ class CCompiler:
         i += 1
         if len(expr) == 1 and expr[0][0] in ["LITERAL", "IDENTIFIER"]:
             value = expr[0][1]
+            return i, ("ASSIGNMENT", var_name, value, line_num)
+        elif len(expr) == 3 and expr[1][0] == "OPERATOR" and expr[1][1] in ["+", "-", "*", "/"]:
+            return i, ("ASSIGNMENT", var_name, (expr[1][1], expr[0][1], expr[2][1]), line_num)
         else:
-            value = " ".join(token[1] for token in expr)
-            for token in expr:
-                if token[0] not in ["LITERAL", "IDENTIFIER", "OPERATOR"]:
-                    self.errors.append(f"Line {line_num}: Invalid token '{token[1]}' in assignment expression")
-                    return i, None
-        return i, ("ASSIGNMENT", var_name, value)
+            self.errors.append(f"Line {line_num}: Invalid expression in assignment")
+            return i, None
 
     def parse_for(self, i):
         line_num = self.tokens[i][2]
-        i += 1  # Skip 'for'
+        i += 1
         if i >= len(self.tokens) or self.tokens[i][1] != "(":
             self.errors.append(f"Line {line_num}: Missing '(' after 'for'")
             return i, None
-        i += 1  # Skip '('
-        
-        # Handle initialization (declaration or assignment)
+        i += 1
         if self.tokens[i][0] == "KEYWORD" and self.tokens[i][1] == "int":
             i, init = self.parse_declaration(i)
         elif self.tokens[i][0] == "IDENTIFIER":
@@ -183,8 +181,6 @@ class CCompiler:
             return i, None
         if not init:
             return i, None
-        
-        # Parse condition
         cond_start = i
         while i < len(self.tokens) and self.tokens[i][1] != ";":
             i += 1
@@ -192,9 +188,7 @@ class CCompiler:
             self.errors.append(f"Line {line_num}: Missing first ';' in 'for' loop")
             return i, None
         condition = self.tokens[cond_start:i]
-        i += 1  # Skip ';'
-        
-        # Parse increment
+        i += 1
         incr_start = i
         while i < len(self.tokens) and self.tokens[i][1] != ")":
             i += 1
@@ -202,14 +196,11 @@ class CCompiler:
             self.errors.append(f"Line {line_num}: Missing ')' in 'for' loop")
             return i, None
         increment = self.tokens[incr_start:i]
-        i += 1  # Skip ')'
-        
+        i += 1
         if i >= len(self.tokens) or self.tokens[i][1] != "{":
             self.errors.append(f"Line {line_num}: Missing '{{' after 'for'")
             return i, None
-        i += 1  # Skip '{'
-        
-        # Parse body (support declarations, assignments, and nested for loops)
+        i += 1
         body = []
         while i < len(self.tokens) and self.tokens[i][1] != "}":
             if self.tokens[i][0] == "KEYWORD" and self.tokens[i][1] == "int":
@@ -224,14 +215,17 @@ class CCompiler:
                 i, stmt = self.parse_for(i)
                 if stmt:
                     body.append(stmt)
+            elif self.tokens[i][0] == "KEYWORD" and self.tokens[i][1] == "return":
+                i, ret = self.parse_return(i)
+                if ret:
+                    body.append(ret)
             else:
                 self.errors.append(f"Line {self.tokens[i][2]}: Unexpected token '{self.tokens[i][1]}' in for loop body")
                 i += 1
         if i >= len(self.tokens):
             self.errors.append(f"Line {line_num}: Missing '}}' in 'for' loop")
             return i, None
-        i += 1  # Skip '}'
-        
+        i += 1
         return i, ("FOR", init, condition, increment, body)
 
     def parse_return(self, i):
@@ -246,7 +240,7 @@ class CCompiler:
             self.errors.append(f"Line {line_num}: Missing ';' after 'return'")
             return i, None
         i += 1
-        return i, ("RETURN", value)
+        return i, ("RETURN", value, line_num)
 
     def semantic_analyzer(self, nodes=None):
         if nodes is None:
@@ -255,21 +249,24 @@ class CCompiler:
             if node[0] == "DECLARATION" or node[0] == "FUNCTION":
                 var_type, var_name = node[1], node[2]
                 value = node[3] if node[0] == "DECLARATION" else None
+                line_num = node[-1]
                 if var_name in self.symbol_table:
-                    self.errors.append(f"Line {self.tokens[0][2]}: Redeclaration of '{var_name}'")
+                    self.errors.append(f"Line {line_num}: Redeclaration of '{var_name}'")
                 else:
-                    self.symbol_table[var_name] = {"type": var_type, "value": int(value) if value and value.isnumeric() else None}
+                    self.symbol_table[var_name] = {"type": var_type, "value": None}
                 if node[0] == "FUNCTION" and len(node) > 3:
                     self.semantic_analyzer(node[3])
             elif node[0] == "ASSIGNMENT":
                 var_name, value = node[1], node[2]
+                line_num = node[-1]
                 if var_name not in self.symbol_table:
-                    self.errors.append(f"Line {self.tokens[0][2]}: Undeclared variable '{var_name}'")
-                elif " " in value:
-                    parts = value.split()
-                    for part in parts:
-                        if part not in ["+", "-", "*", "/"] and part not in self.symbol_table and not part.isnumeric():
-                            self.errors.append(f"Line {self.tokens[0][2]}: Undeclared variable '{part}' in expression")
+                    self.errors.append(f"Line {line_num}: Undeclared variable '{var_name}'")
+                if isinstance(value, tuple):
+                    op, left, right = value
+                    if left not in self.symbol_table and not left.isnumeric():
+                        self.errors.append(f"Line {line_num}: Undeclared variable '{left}'")
+                    if right not in self.symbol_table and not right.isnumeric():
+                        self.errors.append(f"Line {line_num}: Undeclared variable '{right}'")
             elif node[0] == "FOR":
                 init, cond, incr, body = node[1], node[2], node[3], node[4]
                 self.semantic_analyzer([init])
@@ -280,77 +277,114 @@ class CCompiler:
                     if t[0] == "IDENTIFIER" and t[1] not in self.symbol_table:
                         self.errors.append(f"Line {t[2]}: Undeclared variable '{t[1]}' in increment")
                 self.semantic_analyzer(body)
+            elif node[0] == "RETURN":
+                value = node[1]
+                line_num = node[-1]
+                if value not in self.symbol_table and not value.isnumeric():
+                    self.errors.append(f"Line {line_num}: Undeclared variable '{value}' in return")
 
     def generate_intermediate_code(self):
         self.intermediate_code = []
         def process_nodes(nodes):
             for node in nodes:
                 if node[0] == "DECLARATION" and node[3]:
-                    self.intermediate_code.append(f"{node[2]} = {node[3]}")
+                    if isinstance(node[3], tuple):
+                        op, left, right = node[3]
+                        self.intermediate_code.append(("binop", node[2], op, left, right, node[4]))
+                    else:
+                        self.intermediate_code.append(("assign", node[2], node[3], node[4]))
                 elif node[0] == "ASSIGNMENT":
-                    self.intermediate_code.append(f"{node[1]} = {node[2]}")
+                    if isinstance(node[2], tuple):
+                        op, left, right = node[2]
+                        self.intermediate_code.append(("binop", node[1], op, left, right, node[3]))
+                    else:
+                        self.intermediate_code.append(("assign", node[1], node[2], node[3]))
                 elif node[0] == "FUNCTION":
                     if len(node) > 3:
                         process_nodes(node[3])
                 elif node[0] == "RETURN":
-                    self.intermediate_code.append(f"return {node[1]}")
+                    self.intermediate_code.append(("return", node[1], node[2]))
                 elif node[0] == "FOR":
-                    process_nodes(node[4])  # Process loop body only
+                    process_nodes([node[1]])
+                    process_nodes(node[4])
         process_nodes(self.ast)
         return self.intermediate_code
 
     def optimize(self):
-        self.optimized_code = self.intermediate_code.copy()
+        self.optimized_code = []
+        constants = {}
+        used_vars = set()
+
+        # Collect used variables recursively
+        def collect_used_vars(var):
+            if var in used_vars:
+                return
+            used_vars.add(var)
+            for op in self.intermediate_code:
+                if op[0] == "assign" and op[1] == var and op[2].isalpha():
+                    collect_used_vars(op[2])
+                elif op[0] == "binop" and op[1] == var:
+                    if op[3].isalpha():
+                        collect_used_vars(op[3])
+                    if op[4].isalpha():
+                        collect_used_vars(op[4])
+
+        # Start from return statement
+        for op in self.intermediate_code:
+            if op[0] == "return":
+                collect_used_vars(op[1])
+                break
+
+        # Constant folding and propagation
+        for op in self.intermediate_code:
+            if op[0] == "assign":
+                var, value, _ = op[1], op[2], op[3]
+                if value.isnumeric():
+                    constants[var] = int(value)
+                elif value in constants:
+                    constants[var] = constants[value]
+            elif op[0] == "binop":
+                var, op_type, left, right, line_num = op[1], op[2], op[3], op[4], op[5]
+                left_val = int(left) if left.isnumeric() else constants.get(left)
+                right_val = int(right) if right.isnumeric() else constants.get(right)
+                if left_val is not None and right_val is not None:
+                    if op_type == "+":
+                        constants[var] = left_val + right_val
+                    elif op_type == "-":
+                        constants[var] = left_val - right_val
+                    elif op_type == "*":
+                        constants[var] = left_val * right_val
+                    elif op_type == "/":
+                        if right_val != 0:
+                            constants[var] = left_val // right_val
+                        else:
+                            self.errors.append(f"Line {line_num}: Division by zero")
+
+        # Generate optimized code
+        for op in self.intermediate_code:
+            if op[0] == "return":
+                value, line_num = op[1], op[2]
+                final_value = str(constants.get(value, value))
+                self.optimized_code.append(("return", final_value, line_num))
+                break
+
         return self.optimized_code
 
     def generate_assembly(self):
-        self.assembly_code = [
-            "section .text",
-            "global _start",
-            "_start:"
-        ]
-        for line in self.optimized_code:
-            if "=" in line and "return" not in line:
-                parts = line.split(" = ")
-                var, expr = parts[0], parts[1]
-                if " " in expr:
-                    expr_parts = expr.split()
-                    if len(expr_parts) == 3:
-                        if expr_parts[1] == "+":
-                            if expr_parts[0].isnumeric() and expr_parts[2].isnumeric():
-                                self.assembly_code.append(f"mov eax, {expr_parts[0]}")
-                                self.assembly_code.append(f"add eax, {expr_parts[2]}")
-                            else:
-                                self.assembly_code.append(f"mov eax, [{expr_parts[0]}]")
-                                self.assembly_code.append(f"add eax, [{expr_parts[2]}]")
-                            self.assembly_code.append(f"mov [{var}], eax")
-                        elif expr_parts[1] == "*":
-                            if expr_parts[0].isnumeric() and expr_parts[2].isnumeric():
-                                self.assembly_code.append(f"mov eax, {expr_parts[0]}")
-                                self.assembly_code.append(f"imul eax, {expr_parts[2]}")
-                            else:
-                                self.assembly_code.append(f"mov eax, [{expr_parts[0]}]")
-                                self.assembly_code.append(f"imul eax, [{expr_parts[2]}]")
-                            self.assembly_code.append(f"mov [{var}], eax")
-                    elif len(expr_parts) == 5:
-                        if expr_parts[3] == "*":
-                            if expr_parts[2].isnumeric() and expr_parts[4].isnumeric():
-                                self.assembly_code.append(f"mov eax, {expr_parts[2]}")
-                                self.assembly_code.append(f"imul eax, {expr_parts[4]}")
-                            else:
-                                self.assembly_code.append(f"mov eax, [{expr_parts[2]}]")
-                                self.assembly_code.append(f"imul eax, [{expr_parts[4]}]")
-                            if expr_parts[0].isnumeric():
-                                self.assembly_code.append(f"add eax, {expr_parts[0]}")
-                            else:
-                                self.assembly_code.append(f"add eax, [{expr_parts[0]}]")
-                            self.assembly_code.append(f"mov [{var}], eax")
-                else:
-                    self.assembly_code.append(f"mov eax, {expr}")
-                    self.assembly_code.append(f"mov [{var}], eax")
-            elif "return" in line:
-                value = line.split()[1]
-                self.assembly_code.append(f"mov eax, {value}")
+        self.assembly_code = ["section .text", "global _start", "_start:"]
+        for op in self.optimized_code:
+            if op[0] == "assign":
+                self.assembly_code.append(f"mov eax, {op[2]}")
+                self.assembly_code.append(f"mov [{op[1]}], eax")
+            elif op[0] == "binop":
+                self.assembly_code.append(f"mov eax, {'[' + op[3] + ']' if not isinstance(op[3], int) and not op[3].isnumeric() else op[3]}")
+                if op[2] == "+":
+                    self.assembly_code.append(f"add eax, {'[' + op[4] + ']' if not isinstance(op[4], int) and not op[4].isnumeric() else op[4]}")
+                elif op[2] == "*":
+                    self.assembly_code.append(f"imul eax, {'[' + op[4] + ']' if not isinstance(op[4], int) and not op[4].isnumeric() else op[4]}")
+                self.assembly_code.append(f"mov [{op[1]}], eax")
+            elif op[0] == "return":
+                self.assembly_code.append(f"mov eax, {op[1]}")
         self.assembly_code.append("int 0x80")
         return self.assembly_code
 
@@ -381,23 +415,13 @@ class CCompiler:
     def run(self):
         if self.errors:
             return "\n".join(self.errors)
-        output = [
-            "Tokens:",
-            str(self.tokens),
-            "",
-            "AST:",
-            str(self.ast),
-            "",
-            "Intermediate Code:",
-            "\n".join(self.intermediate_code),
-            "",
-            "Optimized Code:",
-            "\n".join(self.optimized_code),
-            "",
-            "Assembly Code:",
-            "\n".join(self.assembly_code)
-        ]
-        return "\n".join(output)
+        return "\n".join([
+            "Tokens:", str(self.tokens), "",
+            "AST:", str(self.ast), "",
+            "Intermediate Code:", "\n".join(str(op) for op in self.intermediate_code), "",
+            "Optimized Code:", "\n".join(str(op) for op in self.optimized_code), "",
+            "Assembly Code:", "\n".join(self.assembly_code)
+        ])
 
 compiler = CCompiler()
 
